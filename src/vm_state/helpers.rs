@@ -6,6 +6,7 @@ use crate::zkevm_opcode_defs::UNMAPPED_PAGE;
 use zk_evm_abstractions::aux::{MemoryKey, MemoryLocation, PubdataCost};
 use zk_evm_abstractions::queries::{DecommittmentQuery, LogQuery, MemoryQuery};
 use zk_evm_abstractions::vm::StorageAccessRefund;
+use zk_evm_abstractions::zkevm_opcode_defs::system_params::STORAGE_AUX_BYTE;
 use zk_evm_abstractions::zkevm_opcode_defs::{
     VersionedHashHeader, VersionedHashNormalizedPreimage,
 };
@@ -158,11 +159,14 @@ impl<
         // tracer takes care of proper placements in the double ended queue
         self.witness_tracer
             .add_log_query(monotonic_cycle_counter, query);
-        self.witness_tracer.record_pubdata_cost_for_query(
-            monotonic_cycle_counter,
-            query,
-            pubdata_cost,
-        );
+
+        if query.aux_byte == STORAGE_AUX_BYTE {
+            self.witness_tracer.record_pubdata_cost_for_query(
+                monotonic_cycle_counter,
+                query,
+                pubdata_cost,
+            );
+        }
 
         (query, pubdata_cost)
     }
@@ -209,6 +213,12 @@ impl<
         query: DecommittmentQuery,
     ) -> anyhow::Result<()> {
         if query.is_fresh == false {
+            self.witness_tracer.execute_decommittment(
+                monotonic_cycle_counter,
+                query,
+                vec![],
+            );
+
             return Ok(());
         }
 

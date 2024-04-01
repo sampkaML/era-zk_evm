@@ -565,7 +565,7 @@ impl Memory for SimpleMemory {
         //
         // Firstly, we check whether it is the current heap:
 
-        let current_heap_page = self.heaps.last().unwrap().0.0;
+        let current_heap_page = self.heaps.last().unwrap().0 .0;
 
         if current_heap_page == page {
             // This is a write to heap, so we treat it as such.
@@ -639,14 +639,10 @@ impl Memory for SimpleMemory {
         ));
 
         // The new pages are marked as available
-        self.page_numbers_indirections.insert(
-            heap_page.0,
-            Indirection::Heap(self.heaps.len() - 1)
-        );
-        self.page_numbers_indirections.insert(
-            aux_heap_page.0,
-            Indirection::AuxHeap(self.heaps.len() - 1)
-        );
+        self.page_numbers_indirections
+            .insert(heap_page.0, Indirection::Heap(self.heaps.len() - 1));
+        self.page_numbers_indirections
+            .insert(aux_heap_page.0, Indirection::AuxHeap(self.heaps.len() - 1));
 
         // we may want to later on cleanup indirections
         self.indirections_to_cleanup_on_return
@@ -663,11 +659,10 @@ impl Memory for SimpleMemory {
             .insert(aux_heap_page.0);
 
         if calldata_fat_pointer.memory_page != 0 {
-            self
-                .page_numbers_indirections
+            self.page_numbers_indirections
                 .get(&calldata_fat_pointer.memory_page)
                 .expect("fat pointer must only point to reachable memory");
-        } 
+        }
     }
 
     // here we potentially want to do some cleanup
@@ -726,7 +721,7 @@ impl Memory for SimpleMemory {
             // We do not need to clean up the page at this point.
             current_frame_indirections_to_cleanup.remove(&current_heap_page);
 
-            // In case (this_address == CODE_ORACLE_ADDRESS && returndata_fat_pointer.length != 0) 
+            // In case (this_address == CODE_ORACLE_ADDRESS && returndata_fat_pointer.length != 0)
             // it is return from the code oracle, we must forever keep the page in memory.
             if this_address != *CODE_ORACLE_ADDRESS || returndata_fat_pointer.length == 0 {
                 previous_frame_indirections_to_cleanup.insert(current_heap_page);
@@ -770,7 +765,8 @@ impl Memory for SimpleMemory {
 
                 // If a page was not intended to be clean up in the first place, we should not clean it up now.
                 // This can be the case for pages returned by the `CodeOracle` precompile.
-                let was_intended_to_cleanup = current_frame_indirections_to_cleanup.remove(&returndata_page); // otherwise it'll be lost
+                let was_intended_to_cleanup =
+                    current_frame_indirections_to_cleanup.remove(&returndata_page); // otherwise it'll be lost
                 if was_intended_to_cleanup {
                     previous_frame_indirections_to_cleanup.insert(returndata_page);
                 }

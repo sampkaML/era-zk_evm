@@ -168,10 +168,12 @@ impl<const N: usize, E: VmEncodingMode<N>> DecodedOpcode<N, E> {
                 };
 
                 let ergs_refund = if variant == LogOpcode::StorageRead {
-                    vm_state.refund_for_partial_query(
-                        vm_state.local_state.monotonic_cycle_counter,
-                        &partial_query,
-                    ).refund()
+                    vm_state
+                        .refund_for_partial_query(
+                            vm_state.local_state.monotonic_cycle_counter,
+                            &partial_query,
+                        )
+                        .refund()
                 } else {
                     0
                 };
@@ -230,10 +232,12 @@ impl<const N: usize, E: VmEncodingMode<N>> DecodedOpcode<N, E> {
                 };
 
                 let ergs_refund = if variant == LogOpcode::StorageWrite {
-                    vm_state.refund_for_partial_query(
-                        vm_state.local_state.monotonic_cycle_counter,
-                        &partial_query,
-                    ).refund()
+                    vm_state
+                        .refund_for_partial_query(
+                            vm_state.local_state.monotonic_cycle_counter,
+                            &partial_query,
+                        )
+                        .refund()
                 } else {
                     0
                 };

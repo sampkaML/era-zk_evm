@@ -213,11 +213,8 @@ impl<
         query: DecommittmentQuery,
     ) -> anyhow::Result<()> {
         if query.is_fresh == false {
-            self.witness_tracer.execute_decommittment(
-                monotonic_cycle_counter,
-                query,
-                vec![],
-            );
+            self.witness_tracer
+                .execute_decommittment(monotonic_cycle_counter, query, vec![]);
 
             return Ok(());
         }

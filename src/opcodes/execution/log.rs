@@ -167,16 +167,11 @@ impl<const N: usize, E: VmEncodingMode<N>> DecodedOpcode<N, E> {
                     is_service: is_first_message,
                 };
 
-                let ergs_refund = if variant == LogOpcode::StorageRead {
-                    vm_state
-                        .refund_for_partial_query(
-                            vm_state.local_state.monotonic_cycle_counter,
-                            &partial_query,
-                        )
-                        .refund()
-                } else {
-                    0
-                };
+                let refund = vm_state.refund_for_partial_query(
+                    vm_state.local_state.monotonic_cycle_counter,
+                    &partial_query,
+                );
+                let ergs_refund = refund.refund();
 
                 let (query, pubdata_cost) = vm_state
                     .access_storage(vm_state.local_state.monotonic_cycle_counter, partial_query);
@@ -231,16 +226,11 @@ impl<const N: usize, E: VmEncodingMode<N>> DecodedOpcode<N, E> {
                     is_service: is_first_message,
                 };
 
-                let ergs_refund = if variant == LogOpcode::StorageWrite {
-                    vm_state
-                        .refund_for_partial_query(
-                            vm_state.local_state.monotonic_cycle_counter,
-                            &partial_query,
-                        )
-                        .refund()
-                } else {
-                    0
-                };
+                let refund = vm_state.refund_for_partial_query(
+                    vm_state.local_state.monotonic_cycle_counter,
+                    &partial_query,
+                );
+                let ergs_refund = refund.refund();
 
                 let (_query, pubdata_cost) = vm_state
                     .access_storage(vm_state.local_state.monotonic_cycle_counter, partial_query);

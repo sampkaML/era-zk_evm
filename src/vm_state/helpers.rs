@@ -126,6 +126,11 @@ impl<
         monotonic_cycle_counter: u32,
         partial_query: &LogQuery,
     ) -> StorageAccessRefund {
+        if partial_query.aux_byte != STORAGE_AUX_BYTE {
+            // Only storage requests support refunds
+            return StorageAccessRefund::Cold;
+        }
+
         let refund = self
             .storage
             .get_access_refund(monotonic_cycle_counter, partial_query);

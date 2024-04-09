@@ -499,10 +499,14 @@ impl Memory for SimpleMemory {
             MemoryType::FatPointer => {
                 assert!(query.rw_flag == false);
                 assert!(query.value_is_pointer == false);
-                let indirection = self
-                    .page_numbers_indirections
-                    .get(&page_number)
-                    .expect("fat pointer only points to reachable memory");
+                println!("Trying to get page: {:?}", page_number);
+                let indirection = self.page_numbers_indirections.get(&page_number).expect(
+                    format!(
+                        "fat pointer only points to reachable memory. Query: {:?}",
+                        query
+                    )
+                    .as_str(),
+                );
 
                 // NOTE: we CAN have a situation when e.g. callee returned part of the heap that
                 // was NEVER written into, so it's page would NOT be resized to the index which we try
@@ -616,6 +620,10 @@ impl Memory for SimpleMemory {
         calldata_fat_pointer: FatPointer,
         _timestamp: Timestamp,
     ) {
+        println!(
+            "Stating blobal frame: base: {:?} new: {:?} fatpointer: {:?}",
+            _current_base_page, new_base_page, calldata_fat_pointer
+        );
         use crate::zkevm_opcode_defs::decoding::EncodingModeProduction;
 
         // we can prepare and preallocate, and then deallocate the number of pages that we want
@@ -641,8 +649,18 @@ impl Memory for SimpleMemory {
         // The new pages are marked as available
         self.page_numbers_indirections
             .insert(heap_page.0, Indirection::Heap(self.heaps.len() - 1));
+        println!(
+            "Global frame start - inserted {:} -> {:?}",
+            heap_page.0,
+            Indirection::Heap(self.heaps.len() - 1)
+        );
         self.page_numbers_indirections
             .insert(aux_heap_page.0, Indirection::AuxHeap(self.heaps.len() - 1));
+        println!(
+            "Global frame start - inserted {:} -> {:?}",
+            aux_heap_page.0,
+            Indirection::AuxHeap(self.heaps.len() - 1)
+        );
 
         // we may want to later on cleanup indirections
         self.indirections_to_cleanup_on_return
@@ -673,6 +691,10 @@ impl Memory for SimpleMemory {
         returndata_fat_pointer: FatPointer,
         _timestamp: Timestamp,
     ) {
+        println!(
+            "Finishing global frame: base: {:?} this addr: {:?} return fatpointer: {:?}",
+            base_page, this_address, returndata_fat_pointer
+        );
         use crate::zkevm_opcode_defs::decoding::EncodingModeProduction;
 
         // stack always goes out of scope
@@ -717,6 +739,11 @@ impl Memory for SimpleMemory {
             assert!(existing.is_none());
             self.page_numbers_indirections
                 .insert(current_heap_page, Indirection::ReturndataExtendedLifetime);
+            println!(
+                "Finish frame  - inserted heap {:} -> {:?}",
+                current_heap_page,
+                Indirection::ReturndataExtendedLifetime
+            );
 
             // We do not need to clean up the page at this point.
             current_frame_indirections_to_cleanup.remove(&current_heap_page);
@@ -738,6 +765,11 @@ impl Memory for SimpleMemory {
             self.page_numbers_indirections.insert(
                 current_aux_heap_page,
                 Indirection::ReturndataExtendedLifetime,
+            );
+            println!(
+                "Finish frame  - inserted aux {:} -> {:?}",
+                current_aux_heap_page,
+                Indirection::ReturndataExtendedLifetime
             );
 
             // We do not need to clean up the page at this point.
@@ -780,6 +812,7 @@ impl Memory for SimpleMemory {
         // now it's safe to cleanup all the indirections we have encountered at this page
 
         for el in current_frame_indirections_to_cleanup.into_iter() {
+            println!("Removing from indirection: {:?}", el);
             let existing = self.page_numbers_indirections.remove(&el);
             assert!(existing.is_some(), "double free in indirection");
         }

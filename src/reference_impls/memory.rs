@@ -1,16 +1,11 @@
-use std::collections::hash_map::RandomState;
-use std::{collections::HashSet, hash::BuildHasher};
-
-use crate::vm_state::CallStackEntry;
 use crate::vm_state::PrimitiveValue;
 use crate::zkevm_opcode_defs::{FatPointer, BOOTLOADER_CALLDATA_PAGE};
 use zk_evm_abstractions::aux::{MemoryPage, Timestamp};
 use zk_evm_abstractions::queries::MemoryQuery;
 use zk_evm_abstractions::vm::{
-    Memory, MemoryType, MAX_CODE_PAGE_SIZE_IN_WORDS, MAX_STACK_PAGE_SIZE_IN_WORDS,
+    Memory, MemoryType,
 };
 use zk_evm_abstractions::zkevm_opcode_defs::system_params::CODE_ORACLE_ADDRESS;
-use zk_evm_abstractions::zkevm_opcode_defs::STATIC_MEMORY_PAGE;
 
 use self::vm_state::{aux_heap_page_from_base, heap_page_from_base, stack_page_from_base};
 
@@ -132,8 +127,8 @@ impl MemoryWrapper {
     }
 
     fn clear_page(&mut self, page: usize) {
-        if let Some(page_handle) = self.memory.get(page) {
-            self.memory[page] = SparseMemoryPage::default();
+        if let Some(page_handle) = self.memory.get_mut(page) {
+            *page_handle = SparseMemoryPage::default();
         }
     }
 }
@@ -371,7 +366,7 @@ impl Memory for SimpleMemory {
         _current_base_page: MemoryPage,
         new_base_page: MemoryPage,
         calldata_fat_pointer: FatPointer,
-        timestamp: Timestamp,
+        _timestamp: Timestamp,
     ) {
         // Besides the calldata page, we also formally include the current stack
         // page, heap page and aux heap page.
@@ -390,7 +385,7 @@ impl Memory for SimpleMemory {
         base_page: MemoryPage,
         last_callstack_this: Address,
         returndata_fat_pointer: FatPointer,
-        timestamp: Timestamp,
+        _timestamp: Timestamp,
     ) {
         // Safe to unwrap here, since `finish_global_frame` is never called with empty stack
         let current_observable_pages = self.observable_pages.current_frame();

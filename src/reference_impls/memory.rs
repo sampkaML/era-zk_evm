@@ -2,9 +2,7 @@ use crate::vm_state::PrimitiveValue;
 use crate::zkevm_opcode_defs::{FatPointer, BOOTLOADER_CALLDATA_PAGE};
 use zk_evm_abstractions::aux::{MemoryPage, Timestamp};
 use zk_evm_abstractions::queries::MemoryQuery;
-use zk_evm_abstractions::vm::{
-    Memory, MemoryType,
-};
+use zk_evm_abstractions::vm::{Memory, MemoryType};
 use zk_evm_abstractions::zkevm_opcode_defs::system_params::CODE_ORACLE_ADDRESS;
 
 use self::vm_state::{aux_heap_page_from_base, heap_page_from_base, stack_page_from_base};
@@ -419,7 +417,13 @@ impl Memory for SimpleMemory {
 
 #[cfg(test)]
 mod tests {
-    use zk_evm_abstractions::{aux::{MemoryIndex, MemoryLocation}, zkevm_opcode_defs::{system_params::BOOTLOADER_FORMAL_ADDRESS, BOOTLOADER_BASE_PAGE, NEW_MEMORY_PAGES_PER_FAR_CALL}};
+    use zk_evm_abstractions::{
+        aux::{MemoryIndex, MemoryLocation},
+        zkevm_opcode_defs::{
+            system_params::BOOTLOADER_FORMAL_ADDRESS, BOOTLOADER_BASE_PAGE,
+            NEW_MEMORY_PAGES_PER_FAR_CALL,
+        },
+    };
 
     use self::vm_state::code_page_candidate_from_base;
 
@@ -428,13 +432,13 @@ mod tests {
     struct MemoryTester {
         memory: SimpleMemory,
         base_pages: Vec<(Address, MemoryPage)>,
-        base_page_counter: u32
+        base_page_counter: u32,
     }
 
     impl MemoryTester {
-        /// Starts a new frame with a certain content of the code page. 
+        /// Starts a new frame with a certain content of the code page.
         /// Note, that it is the job of the decommitter to ensure that there are no two same code pages.
-        /// So this function does not attempt to enforce it. 
+        /// So this function does not attempt to enforce it.
         fn start_frame_with_code(&mut self, address: Address, code: Vec<U256>) -> MemoryPage {
             let old_base_page = self.base_pages.last().unwrap().1;
 
@@ -443,84 +447,120 @@ mod tests {
             self.base_pages.push((address, new_base_page));
 
             // This tester can not pass calldata.
-            self.memory.start_global_frame(old_base_page, new_base_page, FatPointer::empty(), Timestamp(0));
+            self.memory.start_global_frame(
+                old_base_page,
+                new_base_page,
+                FatPointer::empty(),
+                Timestamp(0),
+            );
 
             let code_page = code_page_candidate_from_base(new_base_page);
             for (i, word) in code.into_iter().enumerate() {
                 // Cycle counter and timestamp should not matter here
-                self.memory.specialized_code_query(0, MemoryQuery {
-                    timestamp: Timestamp(0),
-                    location: MemoryLocation {
-                        index: MemoryIndex(i as u32),
-                        page: code_page,
-                        memory_type: MemoryType::Code
+                self.memory.specialized_code_query(
+                    0,
+                    MemoryQuery {
+                        timestamp: Timestamp(0),
+                        location: MemoryLocation {
+                            index: MemoryIndex(i as u32),
+                            page: code_page,
+                            memory_type: MemoryType::Code,
+                        },
+                        value: word,
+                        rw_flag: true,
+                        value_is_pointer: false,
                     },
-                    value: word,
-                    rw_flag: true,
-                    value_is_pointer: false
-                });
+                );
             }
 
             new_base_page
         }
 
-        /// Starts a new frame with a certain content of the code page. 
+        /// Starts a new frame with a certain content of the code page.
         /// Note, that it is the job of the decommitter to ensure that there are no two same code pages.
-        /// So this function does not attempt to enforce it. 
+        /// So this function does not attempt to enforce it.
         fn finish_frame(&mut self, returndata_fat_pointer: FatPointer) {
             let (last_address, last_base_page) = self.base_pages.pop().unwrap();
 
-            self.memory.finish_global_frame(last_base_page, last_address, returndata_fat_pointer, Timestamp(0));
+            self.memory.finish_global_frame(
+                last_base_page,
+                last_address,
+                returndata_fat_pointer,
+                Timestamp(0),
+            );
         }
 
         fn read_query(&mut self, location: MemoryLocation) -> U256 {
-            self.memory.execute_partial_query(0, MemoryQuery {
-                timestamp: Timestamp(0),
-                location,
-                value: U256::zero(),
-                rw_flag: false,
-                value_is_pointer: false
-            }).value
+            self.memory
+                .execute_partial_query(
+                    0,
+                    MemoryQuery {
+                        timestamp: Timestamp(0),
+                        location,
+                        value: U256::zero(),
+                        rw_flag: false,
+                        value_is_pointer: false,
+                    },
+                )
+                .value
         }
 
         fn read_code_query(&mut self, location: MemoryLocation) -> U256 {
             assert!(location.memory_type == MemoryType::Code);
-            self.memory.specialized_code_query(0, MemoryQuery {
-                timestamp: Timestamp(0),
-                location,
-                value: U256::zero(),
-                rw_flag: false,
-                value_is_pointer: false
-            }).value
+            self.memory
+                .specialized_code_query(
+                    0,
+                    MemoryQuery {
+                        timestamp: Timestamp(0),
+                        location,
+                        value: U256::zero(),
+                        rw_flag: false,
+                        value_is_pointer: false,
+                    },
+                )
+                .value
         }
 
         fn get_heap_location(&self, index: u32) -> MemoryLocation {
             MemoryLocation {
                 index: MemoryIndex(index),
                 page: heap_page_from_base(self.base_pages.last().unwrap().1),
-                memory_type: MemoryType::Heap
+                memory_type: MemoryType::Heap,
             }
         }
 
         fn write_query(&mut self, location: MemoryLocation, value: U256) -> U256 {
-            self.memory.execute_partial_query(0, MemoryQuery {
-                timestamp: Timestamp(0),
-                location: location,
-                value,
-                rw_flag: true,
-                value_is_pointer: false
-            }).value
+            self.memory
+                .execute_partial_query(
+                    0,
+                    MemoryQuery {
+                        timestamp: Timestamp(0),
+                        location: location,
+                        value,
+                        rw_flag: true,
+                        value_is_pointer: false,
+                    },
+                )
+                .value
         }
-        
+
         fn new() -> Self {
             let mut memory = SimpleMemory::new();
             // We always have the bootloader frame at the start
-            memory.start_global_frame(MemoryPage(0), MemoryPage(BOOTLOADER_BASE_PAGE), FatPointer::empty(), Timestamp(0));
-            
+            memory.start_global_frame(
+                MemoryPage(0),
+                MemoryPage(BOOTLOADER_BASE_PAGE),
+                FatPointer::empty(),
+                Timestamp(0),
+            );
+
             Self {
                 memory: memory,
                 base_page_counter: 0,
-                base_pages: vec![(Address::zero(), MemoryPage(0)), (*BOOTLOADER_FORMAL_ADDRESS, MemoryPage(BOOTLOADER_BASE_PAGE))]
+                base_pages: vec![
+                    (Address::zero(), MemoryPage(0)),
+                    (*BOOTLOADER_FORMAL_ADDRESS, MemoryPage(BOOTLOADER_BASE_PAGE)),
+                ],
             }
         }
     }
@@ -547,7 +587,7 @@ mod tests {
                 offset: 0,
                 memory_page: location.page.0,
                 start: 0,
-                length: 32
+                length: 32,
             });
 
             location
@@ -557,7 +597,7 @@ mod tests {
         let locations = vec![
             start_frame_and_write_to_page(&mut tester, U256::from(0)),
             start_frame_and_write_to_page(&mut tester, U256::from(1)),
-            start_frame_and_write_to_page(&mut tester, U256::from(2))
+            start_frame_and_write_to_page(&mut tester, U256::from(2)),
         ];
 
         for (i, location) in locations.into_iter().enumerate() {
@@ -577,7 +617,7 @@ mod tests {
         let read_value = tester.read_query(MemoryLocation {
             index: MemoryIndex(0),
             memory_type: MemoryType::FatPointer,
-            page: code_page_candidate_from_base(base_page)
+            page: code_page_candidate_from_base(base_page),
         });
 
         assert_eq!(read_value, U256::from(42));

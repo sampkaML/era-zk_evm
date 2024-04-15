@@ -565,4 +565,21 @@ mod tests {
             assert_eq!(read_value, U256::from(i));
         }
     }
+
+    #[test]
+    fn test_code_page_accessibility() {
+        let mut tester = MemoryTester::new();
+
+        let base_page = tester.start_frame_with_code(Address::zero(), vec![U256::from(42)]);
+        tester.finish_frame(FatPointer::empty());
+
+        // If fat pointer is every created that points to the page, it must be still accessible
+        let read_value = tester.read_query(MemoryLocation {
+            index: MemoryIndex(0),
+            memory_type: MemoryType::FatPointer,
+            page: code_page_candidate_from_base(base_page)
+        });
+
+        assert_eq!(read_value, U256::from(42));
+    }
 }

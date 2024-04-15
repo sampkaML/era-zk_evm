@@ -12,293 +12,211 @@ use zk_evm_abstractions::vm::{
 use zk_evm_abstractions::zkevm_opcode_defs::system_params::CODE_ORACLE_ADDRESS;
 use zk_evm_abstractions::zkevm_opcode_defs::STATIC_MEMORY_PAGE;
 
+use self::vm_state::{aux_heap_page_from_base, heap_page_from_base, stack_page_from_base};
+
 use super::*;
 
-pub struct ReusablePool<
-    T: Sized,
-    InitFn: Fn() -> T,
-    OnPullFn: Fn(&mut T) -> (),
-    OnReturnFn: Fn(&mut T) -> (),
-> {
-    pool: Vec<T>,
-    init_fn: InitFn,
-    on_pull_fn: OnPullFn,
-    on_return_fn: OnReturnFn,
+const PRIMITIVE_VALUE_EMPTY: PrimitiveValue = PrimitiveValue::empty();
+const PAGE_SUBDIVISION_LEN: usize = 64;
+
+#[derive(Debug, Default, Clone)]
+struct SparseMemoryPage {
+    root: Vec<Option<Box<[PrimitiveValue; PAGE_SUBDIVISION_LEN]>>>,
 }
 
-impl<T: Sized, InitFn: Fn() -> T, OnPullFn: Fn(&mut T) -> (), OnReturnFn: Fn(&mut T) -> ()>
-    ReusablePool<T, InitFn, OnPullFn, OnReturnFn>
-{
-    pub fn new_with_capacity(
-        capacity: usize,
-        init_fn: InitFn,
-        on_pull_fn: OnPullFn,
-        on_return_fn: OnReturnFn,
-    ) -> Self {
-        let mut pool = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            let el = init_fn();
-            pool.push(el);
-        }
+impl SparseMemoryPage {
+    fn get(&self, slot: usize) -> &PrimitiveValue {
+        self.root
+            .get(slot / PAGE_SUBDIVISION_LEN)
+            .and_then(|inner| inner.as_ref())
+            .map(|leaf| &leaf[slot % PAGE_SUBDIVISION_LEN])
+            .unwrap_or(&PRIMITIVE_VALUE_EMPTY)
+    }
+    fn set(&mut self, slot: usize, value: PrimitiveValue) -> PrimitiveValue {
+        let root_index = slot / PAGE_SUBDIVISION_LEN;
+        let leaf_index = slot % PAGE_SUBDIVISION_LEN;
 
+        if self.root.len() <= root_index {
+            self.root.resize_with(root_index + 1, || None);
+        }
+        let node = &mut self.root[root_index];
+
+        if let Some(leaf) = node {
+            let old = leaf[leaf_index];
+            leaf[leaf_index] = value;
+            old
+        } else {
+            let mut leaf = [PrimitiveValue::empty(); PAGE_SUBDIVISION_LEN];
+            leaf[leaf_index] = value;
+            self.root[root_index] = Some(Box::new(leaf));
+            PrimitiveValue::empty()
+        }
+    }
+
+    fn get_size(&self) -> usize {
+        self.root.iter().filter_map(|x| x.as_ref()).count()
+            * PAGE_SUBDIVISION_LEN
+            * std::mem::size_of::<PrimitiveValue>()
+    }
+}
+
+impl PartialEq for SparseMemoryPage {
+    fn eq(&self, other: &Self) -> bool {
+        for slot in 0..self.root.len().max(other.root.len()) * PAGE_SUBDIVISION_LEN {
+            if self.get(slot) != other.get(slot) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct MemoryWrapper {
+    memory: Vec<SparseMemoryPage>,
+}
+
+impl PartialEq for MemoryWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        let empty_page = SparseMemoryPage::default();
+        let empty_pages = std::iter::repeat(&empty_page);
+        self.memory
+            .iter()
+            .chain(empty_pages.clone())
+            .zip(other.memory.iter().chain(empty_pages))
+            .take(self.memory.len().max(other.memory.len()))
+            .all(|(a, b)| a == b)
+    }
+}
+
+impl MemoryWrapper {
+    pub fn ensure_page_exists(&mut self, page: usize) {
+        if self.memory.len() <= page {
+            // We don't need to record such events in history
+            // because all these vectors will be empty
+            self.memory.resize_with(page + 1, SparseMemoryPage::default);
+        }
+    }
+
+    pub fn dump_page_content_as_u256_words(
+        &self,
+        page_number: u32,
+        range: std::ops::Range<u32>,
+    ) -> Vec<PrimitiveValue> {
+        if let Some(page) = self.memory.get(page_number as usize) {
+            let mut result = vec![];
+            for i in range {
+                result.push(*page.get(i as usize));
+            }
+            result
+        } else {
+            vec![PrimitiveValue::empty(); range.len()]
+        }
+    }
+
+    pub fn read_slot(&self, page: usize, slot: usize) -> &PrimitiveValue {
+        self.memory
+            .get(page)
+            .map(|page| page.get(slot))
+            .unwrap_or(&PRIMITIVE_VALUE_EMPTY)
+    }
+
+    pub fn get_size(&self) -> usize {
+        self.memory.iter().map(|page| page.get_size()).sum()
+    }
+
+    fn write_to_memory(&mut self, page: usize, slot: usize, value: PrimitiveValue) {
+        self.ensure_page_exists(page);
+        let page_handle = self.memory.get_mut(page).unwrap();
+        page_handle.set(slot, value);
+    }
+
+    fn clear_page(&mut self, page: usize) {
+        if let Some(page_handle) = self.memory.get(page) {
+            self.memory[page] = SparseMemoryPage::default();
+        }
+    }
+}
+
+/// A stack of stacks. The inner stacks are called frames.
+///
+/// Does not support popping from the outer stack. Instead, the outer stack can
+/// push its topmost frame's contents onto the previous frame.
+#[derive(Debug)]
+pub struct FramedStack<T> {
+    data: Vec<T>,
+    frame_start_indices: Vec<usize>,
+}
+
+impl<T> Default for FramedStack<T> {
+    fn default() -> Self {
+        // We typically require at least the first frame to be there
+        // since the last user-provided frame might be reverted
         Self {
-            pool,
-            init_fn,
-            on_pull_fn,
-            on_return_fn,
+            data: vec![],
+            frame_start_indices: vec![0],
         }
     }
-
-    pub fn pull(&mut self) -> T {
-        if let Some(mut existing) = self.pool.pop() {
-            (self.on_pull_fn)(&mut existing);
-
-            existing
-        } else {
-            let mut new = (self.init_fn)();
-            (self.on_pull_fn)(&mut new);
-
-            new
-        }
-    }
-
-    pub fn return_element(&mut self, mut el: T) {
-        (self.on_return_fn)(&mut el);
-        self.pool.push(el);
-    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Indirection {
-    Heap(usize),
-    AuxHeap(usize),
-    ReturndataExtendedLifetime,
-    Empty,
-}
-
-// unfortunately we have to name it
-
-#[derive(Debug)]
-pub struct HeapPagesReusablePool {
-    pool: Vec<Vec<U256>>,
-}
-
-impl HeapPagesReusablePool {
-    pub fn new_with_capacity(capacity: usize) -> Self {
-        let mut pool = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            let el = heap_init();
-            pool.push(el);
-        }
-
-        Self { pool }
+impl<T> FramedStack<T> {
+    fn push_frame(&mut self) {
+        self.frame_start_indices.push(self.data.len());
     }
 
-    pub fn pull(&mut self) -> Vec<U256> {
-        if let Some(mut existing) = self.pool.pop() {
-            heap_on_pull(&mut existing);
-
-            existing
-        } else {
-            let mut new = heap_init();
-            heap_on_pull(&mut new);
-
-            new
-        }
+    pub fn current_frame(&self) -> &[T] {
+        &self.data[*self.frame_start_indices.last().unwrap()..self.data.len()]
     }
 
-    pub fn return_element(&mut self, mut el: Vec<U256>) {
-        heap_on_return(&mut el);
-        self.pool.push(el);
+    fn extend_frame(&mut self, items: impl IntoIterator<Item = T>) {
+        self.data.extend(items);
+    }
+
+    fn clear_frame(&mut self) {
+        let start = *self.frame_start_indices.last().unwrap();
+        self.data.truncate(start);
+    }
+
+    fn merge_frame(&mut self) {
+        self.frame_start_indices.pop().unwrap();
+    }
+
+    fn push_to_frame(&mut self, x: T) {
+        self.data.push(x);
     }
 }
 
-#[derive(Debug)]
-pub struct StackPagesReusablePool {
-    pool: Vec<Vec<PrimitiveValue>>,
+#[derive(Debug, Default)]
+pub struct SimpleMemory {
+    memory: MemoryWrapper,
+    observable_pages: FramedStack<u32>,
 }
 
-impl StackPagesReusablePool {
-    pub fn new_with_capacity(capacity: usize) -> Self {
-        let mut pool = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            let el = stack_init();
-            pool.push(el);
-        }
-
-        Self { pool }
-    }
-
-    pub fn pull(&mut self) -> Vec<PrimitiveValue> {
-        if let Some(mut existing) = self.pool.pop() {
-            stack_on_pull(&mut existing);
-
-            existing
-        } else {
-            let mut new = stack_init();
-            stack_on_pull(&mut new);
-
-            new
-        }
-    }
-
-    pub fn return_element(&mut self, mut el: Vec<PrimitiveValue>) {
-        stack_on_return(&mut el);
-        self.pool.push(el);
-    }
-}
-
-#[derive(Debug)]
-pub struct SimpleMemory<S: BuildHasher + Default = RandomState> {
-    pub stack_pages: Vec<(u32, Vec<PrimitiveValue>)>, // easy to purge
-    pub heaps: Vec<((u32, Vec<U256>), (u32, Vec<U256>))>, // potentially easier to purge
-    pub code_pages: HashMap<u32, Vec<U256>, S>,       // live as long as VM is alive
-    // each frame can get calldata forwarded to it,
-    // and returndata too. We should keep in mind that
-    // - calldata ptr CAN be used as returndata
-    // - returndata ptr CAN be used for calldata
-    // so we should maintain something like a simple graph for it,
-    // based on the assumption that even though calldata originates from some HEAP
-    // it can end up being a returndata, so when we:
-    // - perform far call we are ok to just keep calldata ptr as indirection
-    // - but when we return we should check that our returndata ptr doesn't force us to later on
-    // extend a lifetime of calldataptr indirection
-    pub pages_with_extended_lifetime: HashMap<u32, Vec<U256>, S>,
-    pub page_numbers_indirections: HashMap<u32, Indirection, S>,
-    pub indirections_to_cleanup_on_return: Vec<HashSet<u32, S>>,
-    pub static_memory_page: Vec<U256>,
-    // we do not need a pool for code pages as those are extended lifetime always
-    pub heaps_pool: HeapPagesReusablePool,
-    pub stacks_pool: StackPagesReusablePool,
-}
-
-fn heap_init() -> Vec<U256> {
-    vec![U256::zero(); 1 << 10]
-}
-
-fn stack_init() -> Vec<PrimitiveValue> {
-    vec![PrimitiveValue::empty(); MAX_STACK_PAGE_SIZE_IN_WORDS]
-}
-
-fn heap_on_pull(_el: &mut Vec<U256>) -> () {}
-
-fn stack_on_pull(_el: &mut Vec<PrimitiveValue>) -> () {}
-
-fn heap_on_return(el: &mut Vec<U256>) -> () {
-    el.fill(U256::zero());
-}
-
-fn stack_on_return(el: &mut Vec<PrimitiveValue>) -> () {
-    assert_eq!(el.len(), MAX_STACK_PAGE_SIZE_IN_WORDS);
-    el.fill(PrimitiveValue::empty());
-}
-
-fn resize_to_fit(el: &mut Vec<U256>, idx: usize) {
-    if el.len() >= idx + 1 {
-        return;
-    }
-
-    el.resize(idx + 1, U256::zero());
-}
-
-// as usual, if we rollback the current frame then we apply changes to storage immediately,
-// otherwise we carry rollbacks to the parent's frames
-
-pub fn new_reference_memory_impl() -> ReusablePool<
-    Vec<U256>,
-    impl Fn() -> Vec<U256>,
-    impl Fn(&mut Vec<U256>) -> (),
-    impl Fn(&mut Vec<U256>) -> (),
-> {
-    ReusablePool::new_with_capacity(1 << 10, heap_init, heap_on_pull, heap_on_return)
-}
-
-impl<S: BuildHasher + Default> SimpleMemory<S> {
+impl SimpleMemory {
     pub fn new() -> Self {
-        let mut new = Self {
-            stack_pages: Vec::with_capacity(1024), // we do not need stack or heaps for root frame as it's never accessible
-            heaps: Vec::with_capacity(1024),
-            code_pages: HashMap::with_capacity_and_hasher(1 << 12, S::default()),
-            pages_with_extended_lifetime: HashMap::with_capacity_and_hasher(64, S::default()),
-            page_numbers_indirections: HashMap::with_capacity_and_hasher(64, S::default()),
-            indirections_to_cleanup_on_return: Vec::with_capacity(1024),
-            static_memory_page: Vec::with_capacity(1024),
-            heaps_pool: HeapPagesReusablePool::new_with_capacity(1 << 12),
-            stacks_pool: StackPagesReusablePool::new_with_capacity(1 << 11),
-        };
-
-        // this one virtually exists always
-        new.code_pages
-            .insert(0u32, vec![U256::zero(); MAX_CODE_PAGE_SIZE_IN_WORDS]);
-        new.pages_with_extended_lifetime
-            .insert(BOOTLOADER_CALLDATA_PAGE, vec![U256::zero(); 1 << 10]);
-        new.page_numbers_indirections.insert(0, Indirection::Empty); // quicker lookup
-        new.indirections_to_cleanup_on_return
-            .push(HashSet::with_capacity_and_hasher(4, S::default()));
-        new.heaps.push((
-            (0u32, vec![U256::zero(); 1 << 10]),
-            (0u32, vec![U256::zero(); 1 << 20]),
-        )); // formally, so we can access "last"
-
-        new
+        Self::default()
     }
 
     pub fn new_without_preallocations() -> Self {
-        let mut new = Self {
-            stack_pages: Vec::with_capacity(1024), // we do not need stack or heaps for root frame as it's never accessible
-            heaps: Vec::with_capacity(1024),
-            code_pages: HashMap::with_capacity_and_hasher(1 << 12, S::default()),
-            pages_with_extended_lifetime: HashMap::with_capacity_and_hasher(64, S::default()),
-            page_numbers_indirections: HashMap::with_capacity_and_hasher(64, S::default()),
-            indirections_to_cleanup_on_return: Vec::with_capacity(1024),
-            static_memory_page: Vec::with_capacity(1024),
-            heaps_pool: HeapPagesReusablePool::new_with_capacity(2),
-            stacks_pool: StackPagesReusablePool::new_with_capacity(2),
-        };
-
-        // this one virtually exists always
-        new.code_pages
-            .insert(0u32, vec![U256::zero(); MAX_CODE_PAGE_SIZE_IN_WORDS]);
-        new.pages_with_extended_lifetime
-            .insert(BOOTLOADER_CALLDATA_PAGE, vec![]);
-        new.page_numbers_indirections.insert(0, Indirection::Empty); // quicker lookup
-        new.indirections_to_cleanup_on_return
-            .push(HashSet::with_capacity_and_hasher(4, S::default()));
-        new.heaps.push(((0u32, vec![]), (0u32, vec![]))); // formally, so we can access "last"
-
-        new
+        Self::default()
     }
 }
 
-impl<S: BuildHasher + Default> SimpleMemory<S> {
-    // Can populate code pages only
-    pub fn populate_code(&mut self, elements: Vec<(u32, Vec<U256>)>) -> Vec<(u32, usize)> {
-        let mut results = vec![];
+impl SimpleMemory {
+    pub fn populate_page(&mut self, elements: Vec<(u32, Vec<U256>)>) {
         for (page, values) in elements.into_iter() {
-            assert!(!self.code_pages.contains_key(&page));
-            let len = values.len();
-            assert!(len <= MAX_CODE_PAGE_SIZE_IN_WORDS);
-            let mut values = values;
-            values.resize(MAX_CODE_PAGE_SIZE_IN_WORDS, U256::zero());
-            self.code_pages.insert(page, values);
-            results.push((page, len));
+            for (i, value) in values.into_iter().enumerate() {
+                let value = PrimitiveValue {
+                    value,
+                    is_pointer: false,
+                };
+                self.memory.write_to_memory(page as usize, i, value);
+            }
         }
-
-        results
-    }
-
-    // Can never populate stack or aux heap
-    pub fn populate_heap(&mut self, values: Vec<U256>) {
-        let heaps_data = self.heaps.last_mut().unwrap();
-
-        heaps_data.0 .1 = values;
     }
 
     pub fn polulate_bootloaders_calldata(&mut self, values: Vec<U256>) {
-        *self
-            .pages_with_extended_lifetime
-            .get_mut(&BOOTLOADER_CALLDATA_PAGE)
-            .unwrap() = values;
+        self.populate_page(vec![(BOOTLOADER_CALLDATA_PAGE, values)]);
     }
 
     pub fn dump_page_content(
@@ -319,83 +237,18 @@ impl<S: BuildHasher + Default> SimpleMemory<S> {
 
     pub fn dump_page_content_as_u256_words(
         &self,
-        page_number: u32,
+        page: u32,
         range: std::ops::Range<u32>,
     ) -> Vec<U256> {
-        if let Some(page) = self.code_pages.get(&page_number) {
-            let mut result = vec![];
-            for i in range {
-                if let Some(word) = page.get(i as usize) {
-                    result.push(*word);
-                } else {
-                    result.push(U256::zero());
-                }
-            }
+        self.memory
+            .dump_page_content_as_u256_words(page, range)
+            .into_iter()
+            .map(|v| v.value)
+            .collect()
+    }
 
-            return result;
-        } else {
-            if let Some(content) = self.pages_with_extended_lifetime.get(&page_number) {
-                let mut result = vec![];
-                for i in range {
-                    if let Some(word) = content.get(i as usize) {
-                        result.push(*word);
-                    } else {
-                        result.push(U256::zero());
-                    }
-                }
-
-                return result;
-            }
-
-            for (page_idx, content) in self.stack_pages.iter().rev() {
-                if *page_idx == page_number {
-                    let mut result = vec![];
-                    for i in range {
-                        if let Some(word) = content.get(i as usize) {
-                            result.push(word.value);
-                        } else {
-                            result.push(U256::zero());
-                        }
-                    }
-
-                    return result;
-                } else {
-                    continue;
-                }
-            }
-
-            for (heap_data, aux_heap_data) in self.heaps.iter().rev() {
-                if heap_data.0 == page_number {
-                    let content = &heap_data.1;
-                    let mut result = vec![];
-                    for i in range {
-                        if let Some(word) = content.get(i as usize) {
-                            result.push(*word);
-                        } else {
-                            result.push(U256::zero());
-                        }
-                    }
-
-                    return result;
-                } else if aux_heap_data.0 == page_number {
-                    let content = &aux_heap_data.1;
-                    let mut result = vec![];
-                    for i in range {
-                        if let Some(word) = content.get(i as usize) {
-                            result.push(*word);
-                        } else {
-                            result.push(U256::zero());
-                        }
-                    }
-
-                    return result;
-                } else {
-                    continue;
-                }
-            }
-        }
-
-        vec![U256::zero(); range.len()]
+    pub fn read_slot(&self, page: usize, slot: usize) -> &PrimitiveValue {
+        self.memory.read_slot(page, slot)
     }
 
     pub fn dump_full_page(&self, page_number: u32) -> Vec<[u8; 32]> {
@@ -410,142 +263,50 @@ impl Memory for SimpleMemory {
         _monotonic_cycle_counter: u32,
         mut query: MemoryQuery,
     ) -> MemoryQuery {
-        // we assume that all pages were pre-created, and use a hint here
-        let page_number = query.location.page.0;
         match query.location.memory_type {
-            MemoryType::Stack => {
-                if query.rw_flag {
-                    let (idx, page) = self.stack_pages.last_mut().unwrap();
-                    assert_eq!(*idx, page_number);
-                    let primitive = PrimitiveValue {
-                        value: query.value,
-                        is_pointer: query.value_is_pointer,
-                    };
-                    assert!(
-                        (query.location.index.0 as usize) < page.len(),
-                        "out of bounds for stack page for query {:?}",
-                        query
-                    );
-                    page[query.location.index.0 as usize] = primitive
-                } else {
-                    let (idx, page) = self.stack_pages.last().unwrap();
-                    assert_eq!(*idx, page_number);
-                    assert!(
-                        (query.location.index.0 as usize) < page.len(),
-                        "out of bounds for stack page for query {:?}",
-                        query
-                    );
-                    let primitive = page[query.location.index.0 as usize];
-                    query.value = primitive.value;
-                    query.value_is_pointer = primitive.is_pointer;
-                }
-            }
-            MemoryType::StaticMemory => {
-                assert_eq!(query.location.page.0, STATIC_MEMORY_PAGE);
-                assert!(query.value_is_pointer == false);
-                if query.rw_flag {
-                    // grow if needed
-                    resize_to_fit(
-                        &mut self.static_memory_page,
-                        query.location.index.0 as usize,
-                    );
-                    self.static_memory_page[query.location.index.0 as usize] = query.value;
-                } else {
-                    resize_to_fit(
-                        &mut self.static_memory_page,
-                        query.location.index.0 as usize,
-                    );
-                    let value = self.static_memory_page[query.location.index.0 as usize];
-                    query.value = value;
-                    query.value_is_pointer = false;
-                }
-            }
-            a @ MemoryType::Heap | a @ MemoryType::AuxHeap => {
-                assert!(query.value_is_pointer == false);
-                if query.rw_flag {
-                    let (
-                        (current_heap_page, current_heap_content),
-                        (current_aux_heap_page, current_aux_heap_content),
-                    ) = self.heaps.last_mut().unwrap();
-                    if a == MemoryType::Heap {
-                        debug_assert_eq!(*current_heap_page, query.location.page.0);
-                        resize_to_fit(current_heap_content, query.location.index.0 as usize);
-                        current_heap_content[query.location.index.0 as usize] = query.value;
-                    } else if a == MemoryType::AuxHeap {
-                        debug_assert_eq!(*current_aux_heap_page, query.location.page.0);
-                        resize_to_fit(current_aux_heap_content, query.location.index.0 as usize);
-                        current_aux_heap_content[query.location.index.0 as usize] = query.value;
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    let (
-                        (current_heap_page, current_heap_content),
-                        (current_aux_heap_page, current_aux_heap_content),
-                    ) = self.heaps.last_mut().unwrap();
-                    if a == MemoryType::Heap {
-                        debug_assert_eq!(*current_heap_page, query.location.page.0);
-                        resize_to_fit(current_heap_content, query.location.index.0 as usize);
-                        query.value = current_heap_content[query.location.index.0 as usize];
-                    } else if a == MemoryType::AuxHeap {
-                        debug_assert_eq!(*current_aux_heap_page, query.location.page.0);
-                        resize_to_fit(current_aux_heap_content, query.location.index.0 as usize);
-                        query.value = current_aux_heap_content[query.location.index.0 as usize];
-                    } else {
-                        unreachable!()
-                    }
-                }
+            MemoryType::Stack => {}
+            MemoryType::Heap | MemoryType::AuxHeap => {
+                // The following assertion works fine even when doing a read
+                // from heap through pointer, since `value_is_pointer` can only be set to
+                // `true` during memory writes.
+                assert!(
+                    !query.value_is_pointer,
+                    "Pointers can only be stored on stack"
+                );
             }
             MemoryType::FatPointer => {
-                assert!(query.rw_flag == false);
-                assert!(query.value_is_pointer == false);
-                let indirection = self
-                    .page_numbers_indirections
-                    .get(&page_number)
-                    .expect("fat pointer only points to reachable memory");
-
-                // NOTE: we CAN have a situation when e.g. callee returned part of the heap that
-                // was NEVER written into, so it's page would NOT be resized to the index which we try
-                // to access (even though fat pointe IS in bounds), so we need to use .get()
-                match indirection {
-                    Indirection::Heap(index) => {
-                        let forwarded_heap_data = &self.heaps[*index];
-                        assert_eq!(forwarded_heap_data.0 .0, query.location.page.0);
-                        query.value = forwarded_heap_data
-                            .0
-                             .1
-                            .get(query.location.index.0 as usize)
-                            .copied()
-                            .unwrap_or(U256::zero());
-                    }
-                    Indirection::AuxHeap(index) => {
-                        let forwarded_heap_data = &self.heaps[*index];
-                        assert_eq!(forwarded_heap_data.1 .0, query.location.page.0);
-                        query.value = forwarded_heap_data
-                            .1
-                             .1
-                            .get(query.location.index.0 as usize)
-                            .copied()
-                            .unwrap_or(U256::zero());
-                    }
-                    Indirection::ReturndataExtendedLifetime => {
-                        let page = self
-                            .pages_with_extended_lifetime
-                            .get(&page_number)
-                            .expect("indirection target must exist");
-                        query.value = page
-                            .get(query.location.index.0 as usize)
-                            .copied()
-                            .unwrap_or(U256::zero());
-                    }
-                    Indirection::Empty => {
-                        query.value = U256::zero();
-                    }
-                }
+                assert!(!query.rw_flag);
+                assert!(
+                    !query.value_is_pointer,
+                    "Pointers can only be stored on stack"
+                );
             }
             MemoryType::Code => {
                 unreachable!("code should be through specialized query");
             }
+            MemoryType::StaticMemory => {
+                // While `MemoryType::StaticMemory` is formally supported by `vm@1.5.0`, it is never
+                // used in the system contracts.
+                unreachable!()
+            }
+        }
+
+        let page = query.location.page.0 as usize;
+        let slot = query.location.index.0 as usize;
+
+        if query.rw_flag {
+            self.memory.write_to_memory(
+                page,
+                slot,
+                PrimitiveValue {
+                    value: query.value,
+                    is_pointer: query.value_is_pointer,
+                },
+            );
+        } else {
+            let current_value = self.read_slot(page, slot);
+            query.value = current_value.value;
+            query.value_is_pointer = current_value.is_pointer;
         }
 
         query
@@ -553,235 +314,110 @@ impl Memory for SimpleMemory {
 
     fn specialized_code_query(
         &mut self,
-        monotonic_cycle_counter: u32,
+        _monotonic_cycle_counter: u32,
         mut query: MemoryQuery,
     ) -> MemoryQuery {
         assert_eq!(query.location.memory_type, MemoryType::Code);
-        let page = query.location.page.0;
+        assert!(
+            !query.value_is_pointer,
+            "Pointers are not used for decommmits"
+        );
 
-        // There are two types of places where decommitment could happen:
-        // - Code page
-        // - Heap page of CoreOracle precompile.
-        //
-        // Firstly, we check whether it is the current heap:
+        let page = query.location.page.0 as usize;
+        let slot = query.location.index.0 as usize;
 
-        let current_heap_page = self.heaps.last().unwrap().0 .0;
-
-        if current_heap_page == page {
-            // This is a write to heap, so we treat it as such.
-            query.location.memory_type = MemoryType::Heap;
-            return self.execute_partial_query(monotonic_cycle_counter, query);
-        }
-
-        // Now, we know for sure that it is a code page.
-
-        let idx = query.location.index.0 as usize;
         if query.rw_flag {
-            if self.code_pages.contains_key(&page) == false {
-                self.code_pages
-                    .insert(page, vec![U256::zero(); MAX_CODE_PAGE_SIZE_IN_WORDS]);
-            }
-            let page_content = self.code_pages.get_mut(&page).unwrap();
-            page_content[idx] = query.value;
+            self.memory.write_to_memory(
+                page,
+                slot,
+                PrimitiveValue {
+                    value: query.value,
+                    is_pointer: query.value_is_pointer,
+                },
+            );
         } else {
-            debug_assert!(query.value_is_pointer == false);
-            let page_content = self.code_pages.get(&page).unwrap();
-            query.value = page_content[idx];
+            let current_value = self.read_slot(page, slot);
+            query.value = current_value.value;
+            query.value_is_pointer = current_value.is_pointer;
         }
 
         query
     }
 
-    fn read_code_query(&self, _monotonic_cycle_counter: u32, query: MemoryQuery) -> MemoryQuery {
+    fn read_code_query(
+        &self,
+        _monotonic_cycle_counter: u32,
+        mut query: MemoryQuery,
+    ) -> MemoryQuery {
         assert_eq!(query.location.memory_type, MemoryType::Code);
-        assert!(!query.rw_flag);
-        let page = query.location.page.0;
+        assert!(
+            !query.value_is_pointer,
+            "Pointers are not used for decommmits"
+        );
+        assert!(!query.rw_flag, "Only read queries can be processed");
 
-        let idx = query.location.index.0 as usize;
-        let mut query = query;
+        let page = query.location.page.0 as usize;
+        let slot = query.location.index.0 as usize;
 
-        debug_assert!(query.value_is_pointer == false);
-        let page_content = self.code_pages.get(&page).unwrap();
-        query.value = page_content[idx];
+        let current_value = self.read_slot(page, slot);
+        query.value = current_value.value;
+        query.value_is_pointer = current_value.is_pointer;
 
         query
     }
 
-    // Notify that we start a new global frame. `calldata_fat_pointer` can not leak in a sense
-    // that it's already alive somewhere
     fn start_global_frame(
         &mut self,
         _current_base_page: MemoryPage,
         new_base_page: MemoryPage,
         calldata_fat_pointer: FatPointer,
-        _timestamp: Timestamp,
+        timestamp: Timestamp,
     ) {
-        use crate::zkevm_opcode_defs::decoding::EncodingModeProduction;
-
-        // we can prepare and preallocate, and then deallocate the number of pages that we want
-        let stack_page =
-            CallStackEntry::<8, EncodingModeProduction>::stack_page_from_base(new_base_page);
-        let stack_page_from_pool = self.stacks_pool.pull();
-        self.stack_pages.push((stack_page.0, stack_page_from_pool));
-
-        let heap_page =
-            CallStackEntry::<8, EncodingModeProduction>::heap_page_from_base(new_base_page);
-
-        let aux_heap_page =
-            CallStackEntry::<8, EncodingModeProduction>::aux_heap_page_from_base(new_base_page);
-
-        let heap_page_from_pool = self.heaps_pool.pull();
-        let aux_heap_page_from_pool = self.heaps_pool.pull();
-
-        self.heaps.push((
-            (heap_page.0, heap_page_from_pool),
-            (aux_heap_page.0, aux_heap_page_from_pool),
-        ));
-
-        // The new pages are marked as available
-        self.page_numbers_indirections
-            .insert(heap_page.0, Indirection::Heap(self.heaps.len() - 1));
-        self.page_numbers_indirections
-            .insert(aux_heap_page.0, Indirection::AuxHeap(self.heaps.len() - 1));
-
-        // we may want to later on cleanup indirections
-        self.indirections_to_cleanup_on_return
-            .push(HashSet::with_capacity(4));
-
-        // if we will return from here and returndata page will not "leak" calldata page via forwarding, then we can cleanup the indirection
-        self.indirections_to_cleanup_on_return
-            .last_mut()
-            .unwrap()
-            .insert(heap_page.0);
-        self.indirections_to_cleanup_on_return
-            .last_mut()
-            .unwrap()
-            .insert(aux_heap_page.0);
-
-        if calldata_fat_pointer.memory_page != 0 {
-            self.page_numbers_indirections
-                .get(&calldata_fat_pointer.memory_page)
-                .expect("fat pointer must only point to reachable memory");
-        }
+        // Besides the calldata page, we also formally include the current stack
+        // page, heap page and aux heap page.
+        // The code page will be always left observable, so we don't include it here.
+        self.observable_pages.push_frame();
+        self.observable_pages.extend_frame(vec![
+            calldata_fat_pointer.memory_page,
+            stack_page_from_base(new_base_page).0,
+            heap_page_from_base(new_base_page).0,
+            aux_heap_page_from_base(new_base_page).0,
+        ]);
     }
 
-    // here we potentially want to do some cleanup
     fn finish_global_frame(
         &mut self,
         base_page: MemoryPage,
-        this_address: Address,
+        last_callstack_this: Address,
         returndata_fat_pointer: FatPointer,
-        _timestamp: Timestamp,
+        timestamp: Timestamp,
     ) {
-        use crate::zkevm_opcode_defs::decoding::EncodingModeProduction;
-
-        // stack always goes out of scope
-        let stack_page =
-            CallStackEntry::<8, EncodingModeProduction>::stack_page_from_base(base_page);
-
-        let (stack_page_number, stack_page_to_reuse) = self.stack_pages.pop().unwrap();
-        assert_eq!(stack_page_number, stack_page.0);
-        self.stacks_pool.return_element(stack_page_to_reuse);
-
+        // Safe to unwrap here, since `finish_global_frame` is never called with empty stack
+        let current_observable_pages = self.observable_pages.current_frame();
         let returndata_page = returndata_fat_pointer.memory_page;
 
-        // we can cleanup all the heap pages that derive from base, if one of those is not in returndata
-        let heap_page = CallStackEntry::<8, EncodingModeProduction>::heap_page_from_base(base_page);
-        let aux_heap_page =
-            CallStackEntry::<8, EncodingModeProduction>::aux_heap_page_from_base(base_page);
+        // This is code oracle and some preimage has been decommitted into its memory.
+        // We must keep this memory page forever for future decommits.
+        let is_returndata_page_static =
+            last_callstack_this == *CODE_ORACLE_ADDRESS && returndata_fat_pointer.length > 0;
 
-        // when we finish the global frame then ALL indirections go out of scope except
-        // one that becomes returndata itself (if returndata is not taken from heap or aux heap)
-
-        let (
-            (current_heap_page, current_heap_content),
-            (current_aux_heap_page, current_aux_heap_content),
-        ) = self.heaps.pop().unwrap();
-        assert_eq!(heap_page.0, current_heap_page);
-        assert_eq!(aux_heap_page.0, current_aux_heap_page);
-
-        let mut current_frame_indirections_to_cleanup = self
-            .indirections_to_cleanup_on_return
-            .pop()
-            .expect("indirections must exist");
-        let previous_frame_indirections_to_cleanup = self
-            .indirections_to_cleanup_on_return
-            .last_mut()
-            .expect("previous page indirections must exist");
-
-        if returndata_page == current_heap_page {
-            // we add indirection and move to extended lifetime
-            let existing = self
-                .pages_with_extended_lifetime
-                .insert(current_heap_page, current_heap_content);
-            assert!(existing.is_none());
-            self.page_numbers_indirections
-                .insert(current_heap_page, Indirection::ReturndataExtendedLifetime);
-
-            // We do not need to clean up the page at this point.
-            current_frame_indirections_to_cleanup.remove(&current_heap_page);
-
-            // In case (this_address == CODE_ORACLE_ADDRESS && returndata_fat_pointer.length != 0)
-            // it is return from the code oracle, we must forever keep the page in memory.
-            if this_address != *CODE_ORACLE_ADDRESS || returndata_fat_pointer.length == 0 {
-                previous_frame_indirections_to_cleanup.insert(current_heap_page);
+        for &page in current_observable_pages {
+            // If the page's number is greater than or equal to the `base_page`,
+            // it means that it was created by the internal calls of this contract.
+            // We need to add this check as the calldata pointer is also part of the
+            // observable pages.
+            if page >= base_page.0 && page != returndata_page {
+                self.memory.clear_page(page as usize);
             }
-
-            // and we can reuse another page
-            self.heaps_pool.return_element(current_aux_heap_content);
-        } else if returndata_page == current_aux_heap_page {
-            // we add indirection and move to extended lifetime
-            let existing = self
-                .pages_with_extended_lifetime
-                .insert(current_aux_heap_page, current_aux_heap_content);
-            assert!(existing.is_none());
-            self.page_numbers_indirections.insert(
-                current_aux_heap_page,
-                Indirection::ReturndataExtendedLifetime,
-            );
-
-            // We do not need to clean up the page at this point.
-            current_frame_indirections_to_cleanup.remove(&current_aux_heap_page);
-
-            previous_frame_indirections_to_cleanup.insert(current_aux_heap_page);
-
-            // and we can reuse another page
-            self.heaps_pool.return_element(current_heap_content);
-        } else {
-            // this means "forwarding" of some form,
-            // so we carry indirection forward
-
-            // so it's not masked ret panic page
-            if returndata_page != 0 {
-                assert!(self
-                    .page_numbers_indirections
-                    .contains_key(&returndata_page),
-                    "expected that indirections contain page {}. Heap page = {}, aux heap page = {}, full set = {:?}",
-                    returndata_page,
-                    current_heap_page,
-                    current_aux_heap_page,
-                    &self.page_numbers_indirections
-                );
-
-                // If a page was not intended to be clean up in the first place, we should not clean it up now.
-                // This can be the case for pages returned by the `CodeOracle` precompile.
-                let was_intended_to_cleanup =
-                    current_frame_indirections_to_cleanup.remove(&returndata_page); // otherwise it'll be lost
-                if was_intended_to_cleanup {
-                    previous_frame_indirections_to_cleanup.insert(returndata_page);
-                }
-            }
-
-            // and we can reuse all pages
-            self.heaps_pool.return_element(current_heap_content);
-            self.heaps_pool.return_element(current_aux_heap_content);
         }
 
-        // now it's safe to cleanup all the indirections we have encountered at this page
+        self.observable_pages.clear_frame();
+        self.observable_pages.merge_frame();
 
-        for el in current_frame_indirections_to_cleanup.into_iter() {
-            let existing = self.page_numbers_indirections.remove(&el);
-            assert!(existing.is_some(), "double free in indirection");
+        // If returndata page is static, we do not add it to the list of observable pages,
+        // effectively preventing it from being cleared in the future.
+        if !is_returndata_page_static {
+            self.observable_pages.push_to_frame(returndata_page);
         }
     }
 }

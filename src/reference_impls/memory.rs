@@ -534,4 +534,35 @@ mod tests {
 
         assert_eq!(read_value, U256::from(42));
     }
+
+    #[test]
+    fn test_multiple_returndata_pointers() {
+        let mut tester = MemoryTester::new();
+
+        fn start_frame_and_write_to_page(tester: &mut MemoryTester, value: U256) -> MemoryLocation {
+            tester.start_frame_with_code(Address::zero(), vec![]);
+            let location = tester.get_heap_location(0);
+            tester.write_query(location, value);
+            tester.finish_frame(FatPointer {
+                offset: 0,
+                memory_page: location.page.0,
+                start: 0,
+                length: 32
+            });
+
+            location
+        }
+
+        // Here we generate 3 different returndata pointers. All of them must be accessible.
+        let locations = vec![
+            start_frame_and_write_to_page(&mut tester, U256::from(0)),
+            start_frame_and_write_to_page(&mut tester, U256::from(1)),
+            start_frame_and_write_to_page(&mut tester, U256::from(2))
+        ];
+
+        for (i, location) in locations.into_iter().enumerate() {
+            let read_value = tester.read_query(location);
+            assert_eq!(read_value, U256::from(i));
+        }
+    }
 }

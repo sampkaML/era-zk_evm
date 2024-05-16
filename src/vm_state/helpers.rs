@@ -205,6 +205,18 @@ impl<
             .decommittment_processor
             .prepare_to_decommit(monotonic_cycle_counter, partial_query)?;
 
+        if query.is_fresh {
+            assert!(
+                candidate_page == query.memory_page,
+                "Fresh accesses must use the candidate page"
+            );
+        } else {
+            assert!(
+                candidate_page != query.memory_page,
+                "Non-fresh accesses must not use the candidate page"
+            );
+        }
+
         self.witness_tracer
             .prepare_for_decommittment(monotonic_cycle_counter, query);
 

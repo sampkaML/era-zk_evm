@@ -2,9 +2,13 @@ use crate::zkevm_opcode_defs::system_params::MAX_PUBDATA_COST_PER_QUERY;
 use zk_evm_abstractions::aux::{PubdataCost, Timestamp};
 use zk_evm_abstractions::vm::{Storage, StorageAccessRefund};
 use zk_evm_abstractions::zkevm_opcode_defs::system_params::STORAGE_AUX_BYTE;
+use zk_evm_abstractions::zkevm_opcode_defs::{STORAGE_ACCESS_COLD_READ_COST, STORAGE_ACCESS_COLD_WRITE_COST, STORAGE_ACCESS_WARM_READ_COST, STORAGE_ACCESS_WARM_WRITE_COST, TRANSIENT_STORAGE_AUX_BYTE};
 
 use super::ApplicationData;
 use super::*;
+
+const WARM_READ_REFUND: u32 = STORAGE_ACCESS_COLD_READ_COST - STORAGE_ACCESS_WARM_READ_COST;
+const WARM_WRITE_REFUND: u32 = STORAGE_ACCESS_COLD_WRITE_COST - STORAGE_ACCESS_WARM_WRITE_COST;
 
 #[derive(Debug, Clone)]
 pub struct InMemoryStorage {
@@ -83,6 +87,8 @@ impl InMemoryStorage {
 
         (history, tmp)
     }
+
+
 }
 
 impl Storage for InMemoryStorage {
@@ -90,9 +96,55 @@ impl Storage for InMemoryStorage {
     fn get_access_refund(
         &mut self, // to avoid any hacks inside, like prefetch
         _monotonic_cycle_counter: u32,
-        _partial_query: &LogQuery,
+        partial_query: &LogQuery,
     ) -> StorageAccessRefund {
-        StorageAccessRefund::Cold
+        let aux_byte = partial_query.aux_byte;
+        let shard_level_map = if aux_byte == STORAGE_AUX_BYTE {
+            &mut self.inner[partial_query.shard_id as usize]
+        } else {
+            &mut self.inner_transient[partial_query.shard_id as usize]
+        };
+
+        let shard_level_warm_map = if aux_byte == STORAGE_AUX_BYTE {
+            &mut self.cold_warm_markers[partial_query.shard_id as usize]
+        } else {
+            &mut self.transient_cold_warm_markers[partial_query.shard_id as usize]
+        };
+
+        let refund = if aux_byte == TRANSIENT_STORAGE_AUX_BYTE {
+            // Any transient access is warm. Also, no refund needs to be provided as it is already cheap
+            StorageAccessRefund::Warm { ergs: 0 }
+        } else if aux_byte == STORAGE_AUX_BYTE {
+            if partial_query.rw_flag {
+                // It is a write
+                let address_level_map = shard_level_map.entry(partial_query.address).or_default();
+
+                if address_level_map.contains_key(&partial_query.key) {
+                    // It is a warm write
+                    StorageAccessRefund::Warm {
+                        ergs: WARM_WRITE_REFUND,
+                    }
+                } else {
+                    // It is a cold write
+                    StorageAccessRefund::Cold
+                }
+            } else {
+                let address_level_warm_map = shard_level_warm_map.entry(partial_query.address).or_default();
+                let warm = address_level_warm_map.contains(&partial_query.key);
+
+                if !warm {
+                    StorageAccessRefund::Cold
+                } else {
+                    StorageAccessRefund::Warm {
+                        ergs: WARM_READ_REFUND,
+                    }
+                }
+            }
+        } else {
+            unreachable!()
+        };
+
+        refund
     }
 
     #[track_caller]

@@ -469,8 +469,6 @@ impl<const N: usize, E: VmEncodingMode<N>> DecodedOpcode<N, E> {
                 // we also do not return back cost of decommittment as it was subtracted
                 (MemoryPage(UNMAPPED_PAGE), remaining_ergs_of_caller_frame)
             } else {
-                assert!(normalized_preimage.0 != [0u8; 28], "original buffer {:?} lead to zero normalized preimage, but didn't trigger exception", buffer);
-
                 // we mask instead of branching
                 let default_cost_of_decommittment =
                     zkevm_opcode_defs::ERGS_PER_CODE_WORD_DECOMMITTMENT

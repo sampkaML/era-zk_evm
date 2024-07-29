@@ -470,7 +470,7 @@ impl<const N: usize, E: VmEncodingMode<N>> DecodedOpcode<N, E> {
                 (MemoryPage(UNMAPPED_PAGE), remaining_ergs_of_caller_frame)
             } else {
                 assert!(
-                    header != [0u8; 4] || normalized_preimage.0 != [0u8; 28],
+                    header.0 != [0u8; 4] || normalized_preimage.0 != [0u8; 28],
                     "should got to default aa or panic, not decommit all zeroes",
                 );
                 // we mask instead of branching
